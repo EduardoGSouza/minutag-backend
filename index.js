@@ -12,18 +12,22 @@ const PORT = process.env.PORT || 3000;
 // Configuração do Google Drive
 const FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
 
-// Lê as credenciais da service account a partir da variável de ambiente
-const credsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-const serviceAccount = JSON.parse(credsJson);
-
 function getDriveClient() {
-  const jwt = new google.auth.JWT(
-    serviceAccount.client_email,
-    null,
-    serviceAccount.private_key,
-    ['https://www.googleapis.com/auth/drive.file']
-  );
-  return google.drive({ version: 'v3', auth: jwt });
+  const clientId = process.env.GDRIVE_CLIENT_ID;
+  const clientSecret = process.env.GDRIVE_CLIENT_SECRET;
+  const refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
+  const redirectUri = 'http://localhost'; // deve bater com o usado no setup
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error(
+      'Credenciais do Google Drive faltando. Verifique GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET e GDRIVE_REFRESH_TOKEN.'
+    );
+  }
+
+  const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  oAuth2Client.setCredentials({ refresh_token: refreshToken });
+
+  return google.drive({ version: 'v3', auth: oAuth2Client });
 }
 
 // Rota para receber TXT
