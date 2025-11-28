@@ -11,7 +11,10 @@ const PORT = process.env.PORT || 3000;
 
 // Configuração do Google Drive
 const FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
-const serviceAccount = JSON.parse(process.env.GDRIVE_SERVICE_ACCOUNT);
+
+// Lê as credenciais da service account a partir da variável de ambiente
+const credsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+const serviceAccount = JSON.parse(credsJson);
 
 function getDriveClient() {
   const jwt = new google.auth.JWT(
@@ -53,7 +56,7 @@ app.post('/minutag/upload-txt', async (req, res) => {
       const createRes = await drive.files.create({
         requestBody: fileMetadata,
         media,
-        fields: 'id'
+        fields: 'id',
       });
       fileId = createRes.data.id;
       console.log('Arquivo criado:', filename, 'id:', fileId);
