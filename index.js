@@ -1,78 +1,176 @@
+// index.js
+// Backend do MinuTAG: recebe TXT, garante pasta do professor no Drive e faz upload
+
 const express = require('express');
-const cors = require('cors');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { google } = require('googleapis');
-require('dotenv').config();
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
-const PORT = process.env.PORT || 3000;
+// ------------------ GOOGLE DRIVE VIA OAUTH2 ------------------
 
-// Configuração do Google Drive
-const FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
+// Variáveis de ambiente (Render)
+const {
+  GDRIVE_CLIENT_ID,
+  GDRIVE_CLIENT_SECRET,
+  GDRIVE_REFRESH_TOKEN,
+  GDRIVE_FOLDER_ID, // pasta raiz (onde ficarão as pastas dos professores)
+  PORT
+} = process.env;
 
-function getDriveClient() {
-  const clientId = process.env.GDRIVE_CLIENT_ID;
-  const clientSecret = process.env.GDRIVE_CLIENT_SECRET;
-  const refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
-  const redirectUri = 'http://localhost'; // deve bater com o usado no setup
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error(
-      'Credenciais do Google Drive faltando. Verifique GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET e GDRIVE_REFRESH_TOKEN.'
-    );
-  }
-
-  const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  oAuth2Client.setCredentials({ refresh_token: refreshToken });
-
-  return google.drive({ version: 'v3', auth: oAuth2Client });
+if (!GDRIVE_CLIENT_ID || !GDRIVE_CLIENT_SECRET || !GDRIVE_REFRESH_TOKEN || !GDRIVE_FOLDER_ID) {
+  console.warn('ATENÇÃO: Variáveis GDRIVE_* não configuradas. Upload para o Drive não vai funcionar.');
 }
 
-// Rota para receber TXT
+// Cliente OAuth2 reaproveitando o refresh token
+const oauth2Client = new google.auth.OAuth2(
+  GDRIVE_CLIENT_ID,
+  GDRIVE_CLIENT_SECRET,
+  'urn:ietf:wg:oauth:2.0:oob' // não é usado em runtime, só precisa de um valor
+);
+
+oauth2Client.setCredentials({
+  refresh_token: GDRIVE_REFRESH_TOKEN
+});
+
+const drive = google.drive({
+  version: 'v3',
+  auth: oauth2Client
+});
+
+// --------------- FUNÇÕES AUXILIARES ---------------
+
+// Cria (ou acha) a pasta do professor dentro de GDRIVE_FOLDER_ID
+async function getOrCreateProfessorFolder(professorName) {
+  const rootFolderId = GDRIVE_FOLDER_ID;
+  const safeName = (professorName && professorName.trim())
+    ? professorName.trim()
+    : 'SEM_NOME';
+
+  // 1) procurar pasta com esse nome dentro da raiz configurada
+  const list = await drive.files.list({
+    q: [
+      "mimeType = 'application/vnd.google-apps.folder'",
+      "trashed = false",
+      `name = '${safeName.replace(/'/g, "\\'")}'`,
+      `'${rootFolderId}' in parents`
+    ].join(' and '),
+    fields: 'files(id,name)',
+    spaces: 'drive'
+  });
+
+  if (list.data.files && list.data.files.length > 0) {
+    const folderId = list.data.files[0].id;
+    console.log(`Pasta do professor encontrada: ${safeName} -> ${folderId}`);
+    return folderId;
+  }
+
+  // 2) não achou: criar pasta
+  const create = await drive.files.create({
+    requestBody: {
+      name: safeName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [rootFolderId]
+    },
+    fields: 'id,name'
+  });
+
+  console.log(`Pasta do professor criada: ${safeName} -> ${create.data.id}`);
+  return create.data.id;
+}
+
+// grava conteúdo em um TXT temporário
+async function writeTempTxt(filename, content) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'minutag-'));
+  const safeName = (filename || 'anotacoes.txt').replace(/[\\/:*?"<>|]/g, '_');
+  const fullPath = path.join(tmpDir, safeName);
+  await fs.promises.writeFile(fullPath, content ?? '', 'utf8');
+  return fullPath;
+}
+
+// upload efetivo para o Drive
+async function uploadTxtToDrive(localPath, filename, folderId) {
+  const fileMetadata = {
+    name: filename,
+    parents: [folderId]
+  };
+
+  const media = {
+    mimeType: 'text/plain',
+    body: fs.createReadStream(localPath)
+  };
+
+  const res = await drive.files.create({
+    requestBody: fileMetadata,
+    media,
+    fields: 'id,name,parents'
+  });
+
+  return res.data;
+}
+
+// --------------- ROTA USADA PELO MINUTAG ---------------
+
 app.post('/minutag/upload-txt', async (req, res) => {
   try {
-    const { filename, content } = req.body;
+    const { filename, content, professor } = req.body || {};
 
     if (!filename || !content) {
-      return res.status(400).json({ ok: false, error: 'filename e content são obrigatórios' });
-    }
-
-    const drive = getDriveClient();
-
-    // Verifica se já existe arquivo com esse nome
-    const q = `'${FOLDER_ID}' in parents and name = '${filename.replace(/'/g, "\\'")}' and trashed = false`;
-    const listRes = await drive.files.list({ q, fields: 'files(id, name)' });
-
-    const fileMetadata = { name: filename, parents: [FOLDER_ID] };
-    const media = { mimeType: 'text/plain', body: content };
-
-    let fileId;
-
-    if (listRes.data.files && listRes.data.files.length) {
-      // Atualiza arquivo existente
-      fileId = listRes.data.files[0].id;
-      await drive.files.update({ fileId, media });
-      console.log('Arquivo atualizado:', filename);
-    } else {
-      // Cria novo
-      const createRes = await drive.files.create({
-        requestBody: fileMetadata,
-        media,
-        fields: 'id',
+      return res.status(400).json({
+        ok: false,
+        error: 'Campos filename e content são obrigatórios.'
       });
-      fileId = createRes.data.id;
-      console.log('Arquivo criado:', filename, 'id:', fileId);
+    }
+    if (!GDRIVE_CLIENT_ID || !GDRIVE_CLIENT_SECRET || !GDRIVE_REFRESH_TOKEN || !GDRIVE_FOLDER_ID) {
+      return res.status(500).json({
+        ok: false,
+        error: 'Variáveis GDRIVE_* não configuradas no servidor.'
+      });
     }
 
-    res.json({ ok: true, fileId });
-  } catch (e) {
-    console.error('Erro ao enviar para Drive:', e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.log('Recebido TXT:', {
+      filename,
+      professor: professor || '(sem professor)',
+      length: content.length
+    });
+
+    // 1) garante pasta do professor
+    const professorFolderId = await getOrCreateProfessorFolder(professor);
+
+    // 2) TXT temporário
+    const localPath = await writeTempTxt(filename, content);
+
+    let driveFile;
+    try {
+      // 3) upload dentro da pasta do professor
+      driveFile = await uploadTxtToDrive(localPath, filename, professorFolderId);
+      console.log('Upload concluído:', driveFile);
+    } finally {
+      // apaga diretório temporário
+      fs.rmSync(path.dirname(localPath), { recursive: true, force: true });
+    }
+
+    return res.json({
+      ok: true,
+      fileId: driveFile.id,
+      fileName: driveFile.name,
+      professor: professor || null
+    });
+  } catch (err) {
+    console.error('Erro em /minutag/upload-txt:', err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'Erro interno ao enviar TXT para o Drive.'
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend rodando na porta ${PORT}`);
+// --------------- INICIALIZAÇÃO ---------------
+
+const port = PORT || 3000;
+app.listen(port, () => {
+  console.log(`MinuTAG backend ouvindo na porta ${port}`);
 });
